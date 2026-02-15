@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>ladders</title>
+<title>24時間ラダー・スケジューラー</title>
 <meta name="description" content="1日の生活配分を縦ラダーで可視化する生活リズム管理アプリ">
 <meta name="theme-color" content="#1a1a2e">
 <link rel="manifest" href="manifest.webmanifest">
@@ -521,6 +521,35 @@ select { cursor: pointer; appearance: none;
 
 .icon-btn:hover { color: var(--text-primary); border-color: var(--accent); }
 
+
+/* Template switcher */
+.template-switcher { display: flex; gap: 6px; margin-bottom: 14px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; }
+.template-switcher::-webkit-scrollbar { display: none; }
+.tmpl-chip {
+  flex-shrink: 0; padding: 7px 14px; border-radius: 20px;
+  border: 1.5px solid var(--border); background: var(--bg-card);
+  color: var(--text-secondary); font-family: var(--font-body);
+  font-size: 0.75rem; font-weight: 500; cursor: pointer;
+  transition: all 0.2s; white-space: nowrap; max-width: 140px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.tmpl-chip:hover { border-color: var(--accent); color: var(--text-primary); }
+.tmpl-chip.active { background: var(--accent); border-color: var(--accent); color: white; }
+.tmpl-chip-add {
+  flex-shrink: 0; width: 32px; height: 32px; border-radius: 50%;
+  border: 1.5px dashed var(--border); background: transparent;
+  color: var(--text-muted); font-size: 1.1rem;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all 0.2s;
+}
+.tmpl-chip-add:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Template manage list in settings */
+.tmpl-manage-item { display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg-surface); border-radius: var(--radius-sm); margin-bottom: 6px; }
+.tmpl-manage-item.active-tmpl { border-left: 3px solid var(--accent); }
+.tmpl-manage-name { flex: 1; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tmpl-manage-actions { display: flex; gap: 4px; flex-shrink: 0; }
+
 /* Responsive */
 @media (max-width: 400px) {
   .summary-grid { grid-template-columns: 1fr; }
@@ -612,7 +641,7 @@ const PALETTE = [
 
 // ─── IndexedDB ───────────────────────────────────────────────
 
-const DB_NAME = 'LadderScheduler';
+const DB_NAME = 'LadderSchedulerV2';
 const DB_VERSION = 1;
 
 function openDB() {
@@ -647,24 +676,62 @@ async function dbSet(key, val) {
   });
 }
 
-async function loadAll() {
-  const [categories, blocks, meta, lastBackup] = await Promise.all([
-    dbGet('categories'), dbGet('blocks'), dbGet('graphMeta'), dbGet('lastBackup')
-  ]);
-  return {
-    categories: categories || [],
-    blocks: blocks || [],
-    meta: meta || { title: '生活テンプレート', createdAt: new Date().toISOString() },
-    lastBackup: lastBackup || null
-  };
+
+async function dbDel(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('store','readwrite');
+    tx.objectStore('store').delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
-async function saveAll(categories, blocks, meta) {
-  await Promise.all([
-    dbSet('categories', categories),
-    dbSet('blocks', blocks),
-    dbSet('graphMeta', meta)
-  ]);
+// Migrate from old single-template DB
+async function migrateV1() {
+  return new Promise(resolve => {
+    const req = indexedDB.open('LadderScheduler', 1);
+    req.onerror = () => resolve(null);
+    req.onsuccess = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('store')) { db.close(); resolve(null); return; }
+      const tx = db.transaction('store','readonly');
+      const s = tx.objectStore('store');
+      const g = {};
+      for (const key of ['categories','blocks','graphMeta','lastBackup']) {
+        const r = s.get(key);
+        r.onsuccess = () => { g[key] = r.result; };
+      }
+      tx.oncomplete = () => { db.close(); resolve((g.categories || g.blocks) ? g : null); };
+    };
+  });
+}
+
+async function loadAllData() {
+  let existing = await dbGet('templates');
+  if (!existing) {
+    const v1 = await migrateV1();
+    if (v1 && (v1.categories?.length || v1.blocks?.length)) {
+      const id = 'migrated-default';
+      const tmpl = { id, title: v1.graphMeta?.title || '生活テンプレート', createdAt: v1.graphMeta?.createdAt || new Date().toISOString() };
+      await dbSet('templates', [tmpl]);
+      await dbSet('categories', v1.categories || []);
+      await dbSet('blocks:' + id, v1.blocks || []);
+      await dbSet('activeTemplateId', id);
+      if (v1.lastBackup) await dbSet('lastBackup', v1.lastBackup);
+      existing = [tmpl];
+    }
+  }
+  let templates = existing || [];
+  if (templates.length === 0) {
+    const t = { id: crypto.randomUUID(), title: '平日', createdAt: new Date().toISOString() };
+    templates = [t]; await dbSet('templates', templates);
+  }
+  const activeId = (await dbGet('activeTemplateId')) || templates[0].id;
+  const categories = (await dbGet('categories')) || [];
+  const blocks = (await dbGet('blocks:' + activeId)) || [];
+  const lastBackup = await dbGet('lastBackup');
+  return { templates, activeTemplateId: activeId, categories, blocks, lastBackup };
 }
 
 // ─── Time options ────────────────────────────────────────────
@@ -685,236 +752,198 @@ const Icons = {
   settings: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.32 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
   x: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
   edit: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+  copy: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>,
   clock: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
 };
 
 // ─── MAIN APP ────────────────────────────────────────────────
 
 function App() {
+  const [templates, setTemplates] = useState([]);
+  const [activeId, setActiveIdRaw] = useState('');
   const [categories, setCategories] = useState([]);
   const [blocks, setBlocks] = useState([]);
-  const [meta, setMeta] = useState({ title: '生活テンプレート', createdAt: new Date().toISOString() });
   const [lastBackup, setLastBackup] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [tab, setTab] = useState('timeline');
   const [toast, setToast] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
 
-  // Load from DB
   useEffect(() => {
-    loadAll().then(data => {
-      setCategories(data.categories);
-      setBlocks(data.blocks);
-      setMeta(data.meta);
-      setLastBackup(data.lastBackup);
-      setLoaded(true);
+    loadAllData().then(d => {
+      setTemplates(d.templates); setActiveIdRaw(d.activeTemplateId);
+      setCategories(d.categories); setBlocks(d.blocks);
+      setLastBackup(d.lastBackup); setLoaded(true);
     });
   }, []);
 
-  // Save on change
-  useEffect(() => {
-    if (!loaded) return;
-    saveAll(categories, blocks, meta);
-  }, [categories, blocks, meta, loaded]);
+  const showToast = useCallback(msg => { setToast(msg); setTimeout(() => setToast(null), 2500); }, []);
 
-  const showToast = useCallback((msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 2500);
-  }, []);
+  useEffect(() => { if (loaded) dbSet('categories', categories); }, [categories, loaded]);
+  useEffect(() => { if (loaded && activeId) dbSet('blocks:' + activeId, blocks); }, [blocks, activeId, loaded]);
+  useEffect(() => { if (loaded) dbSet('templates', templates); }, [templates, loaded]);
+  useEffect(() => { if (loaded && activeId) dbSet('activeTemplateId', activeId); }, [activeId, loaded]);
 
-  // Sorted blocks
-  const sortedBlocks = useMemo(() => [...blocks].sort((a,b) => a.startMin - b.startMin), [blocks]);
+  const switchTemplate = useCallback(async id => {
+    if (id === activeId) return;
+    const nb = (await dbGet('blocks:' + id)) || [];
+    setActiveIdRaw(id); setBlocks(nb);
+  }, [activeId]);
 
-  // Display blocks with FREE
-  const displayBlocks = useMemo(() => {
-    const free = generateFreeBlocks(sortedBlocks);
-    return [...sortedBlocks, ...free].sort((a,b) => a.startMin - b.startMin);
-  }, [sortedBlocks]);
+  const addTemplate = useCallback(title => {
+    const id = uuid();
+    setTemplates(p => [...p, { id, title: title || '新しいテンプレート', createdAt: new Date().toISOString() }]);
+    dbSet('blocks:' + id, []);
+    setActiveIdRaw(id); setBlocks([]);
+    showToast('テンプレートを作成しました');
+  }, [showToast]);
 
-  // Summary
+  const duplicateTemplate = useCallback(async srcId => {
+    const src = templates.find(t => t.id === srcId); if (!src) return;
+    const id = uuid();
+    const srcBlocks = (await dbGet('blocks:' + srcId)) || [];
+    const newBlocks = srcBlocks.map(b => ({ ...b, id: uuid() }));
+    await dbSet('blocks:' + id, newBlocks);
+    setTemplates(p => [...p, { id, title: src.title + ' (コピー)', createdAt: new Date().toISOString() }]);
+    setActiveIdRaw(id); setBlocks(newBlocks);
+    showToast('テンプレートを複製しました');
+  }, [templates, showToast]);
+
+  const deleteTemplate = useCallback(async id => {
+    if (templates.length <= 1) { showToast('最後のテンプレートは削除できません'); return; }
+    await dbDel('blocks:' + id);
+    const nl = templates.filter(t => t.id !== id); setTemplates(nl);
+    if (activeId === id) { const nb = (await dbGet('blocks:' + nl[0].id)) || []; setActiveIdRaw(nl[0].id); setBlocks(nb); }
+    showToast('テンプレートを削除しました');
+  }, [templates, activeId, showToast]);
+
+  const renameTemplate = useCallback((id, title) => { setTemplates(p => p.map(t => t.id === id ? { ...t, title } : t)); }, []);
+
+  const activeTmpl = useMemo(() => templates.find(t => t.id === activeId), [templates, activeId]);
+  const sortedBlocks = useMemo(() => [...blocks].sort((a, b) => a.startMin - b.startMin), [blocks]);
+  const displayBlocks = useMemo(() => { const f = generateFreeBlocks(sortedBlocks); return [...sortedBlocks, ...f].sort((a, b) => a.startMin - b.startMin); }, [sortedBlocks]);
   const summary = useMemo(() => calcSummary(sortedBlocks, categories), [sortedBlocks, categories]);
+  const backupWarning = useMemo(() => { if (!lastBackup) return blocks.length > 0; return Date.now() - new Date(lastBackup).getTime() > 30 * 24 * 60 * 60 * 1000; }, [lastBackup, blocks]);
+  const lastBlockEnd = useMemo(() => sortedBlocks.length === 0 ? 0 : sortedBlocks[sortedBlocks.length - 1].endMin, [sortedBlocks]);
 
-  // 30-day backup warning
-  const backupWarning = useMemo(() => {
-    if (!lastBackup) return blocks.length > 0;
-    const diff = Date.now() - new Date(lastBackup).getTime();
-    return diff > 30 * 24 * 60 * 60 * 1000;
-  }, [lastBackup, blocks]);
-
-  // Last block end for suggestion
-  const lastBlockEnd = useMemo(() => {
-    if (sortedBlocks.length === 0) return 0;
-    return sortedBlocks[sortedBlocks.length - 1].endMin;
-  }, [sortedBlocks]);
-
-  // Add block
   const addBlock = useCallback((startMin, endMin, categoryId) => {
     if (startMin >= endMin) return 'エラー: 開始時刻は終了時刻より前にしてください';
     if (startMin % 15 !== 0 || endMin % 15 !== 0) return 'エラー: 15分刻みにしてください';
     if (!categories.find(c => c.id === categoryId)) return 'エラー: カテゴリを選択してください';
-
-    const newBlock = { id: uuid(), startMin, endMin, categoryId };
-    let newBlocks = [...blocks, newBlock].sort((a,b) => a.startMin - b.startMin);
-    
-    // Overlap auto-adjust
-    for (let i = 1; i < newBlocks.length; i++) {
-      if (newBlocks[i].startMin < newBlocks[i-1].endMin) {
-        newBlocks[i] = { ...newBlocks[i], startMin: newBlocks[i-1].endMin };
-        if (newBlocks[i].endMin <= newBlocks[i].startMin) {
-          return 'エラー: 他のブロックと重なっており、自動調整できません。時間を変更してください。';
-        }
+    const nb = { id: uuid(), startMin, endMin, categoryId };
+    let arr = [...blocks, nb].sort((a, b) => a.startMin - b.startMin);
+    for (let i = 1; i < arr.length; i++) {
+      if (arr[i].startMin < arr[i - 1].endMin) {
+        arr[i] = { ...arr[i], startMin: arr[i - 1].endMin };
+        if (arr[i].endMin <= arr[i].startMin) return 'エラー: 他のブロックと重なっており、自動調整できません。時間を変更してください。';
       }
     }
-
-    setBlocks(newBlocks);
-    return null;
+    setBlocks(arr); return null;
   }, [blocks, categories]);
 
-  // Delete block
-  const deleteBlock = useCallback((id) => {
-    setBlocks(prev => prev.filter(b => b.id !== id));
-  }, []);
+  const deleteBlock = useCallback(id => { setBlocks(p => p.filter(b => b.id !== id)); }, []);
 
-  // Export
-  const exportData = useCallback(() => {
-    const data = {
-      schemaVersion: 1,
-      exportedAt: new Date().toISOString(),
-      graph: { title: meta.title, createdAt: meta.createdAt },
-      categories,
-      blocks: sortedBlocks
-    };
+  // Export all templates
+  const exportData = useCallback(async () => {
+    const allBlocks = {};
+    for (const t of templates) allBlocks[t.id] = (await dbGet('blocks:' + t.id)) || [];
+    const data = { schemaVersion: 2, exportedAt: new Date().toISOString(), templates, activeTemplateId: activeId, categories, allBlocks };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `ladder-scheduler-${new Date().toISOString().slice(0,10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    const now = new Date().toISOString();
-    setLastBackup(now);
-    dbSet('lastBackup', now);
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = `ladder-scheduler-${new Date().toISOString().slice(0, 10)}.json`; a.click(); URL.revokeObjectURL(url);
+    const now = new Date().toISOString(); setLastBackup(now); dbSet('lastBackup', now);
     showToast('エクスポート完了');
-  }, [meta, categories, sortedBlocks, showToast]);
+  }, [templates, activeId, categories, showToast]);
 
-  // Import
-  const importData = useCallback((jsonStr) => {
+  // Import (merge, supports v1 + v2)
+  const importData = useCallback(async jsonStr => {
     try {
       const data = JSON.parse(jsonStr);
-      if (!data.categories || !data.blocks) throw new Error('Invalid format');
-
-      const result = { catAdded: 0, catSkipped: 0, blockAdded: 0, blockDuplicate: 0, blockInvalid: 0, blockOverlap: 0 };
-
-      // Merge categories
+      const result = { catAdded: 0, catSkipped: 0, blockAdded: 0, blockDuplicate: 0, blockInvalid: 0, blockOverlap: 0, tmplAdded: 0, tmplSkipped: 0 };
+      const isV1 = data.schemaVersion === 1 || (!data.templates && data.blocks);
       let newCats = [...categories];
-      for (const cat of data.categories) {
+      for (const cat of (data.categories || [])) {
         if (newCats.find(c => c.id === cat.id)) { result.catSkipped++; continue; }
-        newCats.push({ id: cat.id, name: cat.name, color: cat.color });
-        result.catAdded++;
+        newCats.push({ id: cat.id, name: cat.name, color: cat.color }); result.catAdded++;
       }
-
-      // Merge blocks
-      let newBlocks = [...blocks];
-      const addedThisRound = [];
-      for (const blk of data.blocks) {
-        // Duplicate check
-        if (newBlocks.find(b => b.id === blk.id)) { result.blockDuplicate++; continue; }
-        // Validate
-        if (blk.startMin == null || blk.endMin == null || blk.startMin < 0 || blk.endMin > 1440 ||
-            blk.startMin % 15 !== 0 || blk.endMin % 15 !== 0 || blk.startMin >= blk.endMin ||
-            !newCats.find(c => c.id === blk.categoryId)) {
-          result.blockInvalid++;
-          continue;
+      if (isV1) {
+        let nb = [...blocks]; const added = [];
+        for (const blk of (data.blocks || [])) {
+          if (nb.find(b => b.id === blk.id)) { result.blockDuplicate++; continue; }
+          if (blk.startMin == null || blk.endMin == null || blk.startMin < 0 || blk.endMin > 1440 || blk.startMin % 15 !== 0 || blk.endMin % 15 !== 0 || blk.startMin >= blk.endMin || !newCats.find(c => c.id === blk.categoryId)) { result.blockInvalid++; continue; }
+          if ([...nb, ...added].some(e => blk.startMin < e.endMin && e.startMin < blk.endMin)) { result.blockOverlap++; continue; }
+          added.push({ id: blk.id, startMin: blk.startMin, endMin: blk.endMin, categoryId: blk.categoryId }); result.blockAdded++;
         }
-        // Overlap check with existing + newly added
-        const allExisting = [...newBlocks, ...addedThisRound];
-        const hasOverlap = allExisting.some(e => blk.startMin < e.endMin && e.startMin < blk.endMin);
-        if (hasOverlap) { result.blockOverlap++; continue; }
-        
-        addedThisRound.push({ id: blk.id, startMin: blk.startMin, endMin: blk.endMin, categoryId: blk.categoryId });
-        result.blockAdded++;
+        setBlocks([...nb, ...added].sort((a, b) => a.startMin - b.startMin));
+      } else {
+        let newTmpls = [...templates]; const importBlocks = data.allBlocks || {};
+        for (const tmpl of (data.templates || [])) {
+          if (newTmpls.find(t => t.id === tmpl.id)) {
+            result.tmplSkipped++;
+            const existing = (await dbGet('blocks:' + tmpl.id)) || []; const added = [];
+            for (const blk of (importBlocks[tmpl.id] || [])) {
+              if (existing.find(b => b.id === blk.id)) { result.blockDuplicate++; continue; }
+              if (blk.startMin == null || blk.endMin == null || blk.startMin < 0 || blk.endMin > 1440 || blk.startMin % 15 !== 0 || blk.endMin % 15 !== 0 || blk.startMin >= blk.endMin || !newCats.find(c => c.id === blk.categoryId)) { result.blockInvalid++; continue; }
+              if ([...existing, ...added].some(e => blk.startMin < e.endMin && e.startMin < blk.endMin)) { result.blockOverlap++; continue; }
+              added.push({ id: blk.id, startMin: blk.startMin, endMin: blk.endMin, categoryId: blk.categoryId }); result.blockAdded++;
+            }
+            if (added.length > 0) { const merged = [...existing, ...added].sort((a, b) => a.startMin - b.startMin); await dbSet('blocks:' + tmpl.id, merged); if (tmpl.id === activeId) setBlocks(merged); }
+          } else {
+            newTmpls.push({ id: tmpl.id, title: tmpl.title, createdAt: tmpl.createdAt }); result.tmplAdded++;
+            const tb = [];
+            for (const blk of (importBlocks[tmpl.id] || [])) {
+              if (blk.startMin == null || blk.endMin == null || blk.startMin < 0 || blk.endMin > 1440 || blk.startMin % 15 !== 0 || blk.endMin % 15 !== 0 || blk.startMin >= blk.endMin || !newCats.find(c => c.id === blk.categoryId)) { result.blockInvalid++; continue; }
+              if (tb.some(e => blk.startMin < e.endMin && e.startMin < blk.endMin)) { result.blockOverlap++; continue; }
+              tb.push({ id: blk.id, startMin: blk.startMin, endMin: blk.endMin, categoryId: blk.categoryId }); result.blockAdded++;
+            }
+            await dbSet('blocks:' + tmpl.id, tb);
+          }
+        }
+        setTemplates(newTmpls);
       }
-
-      setCategories(newCats);
-      setBlocks([...newBlocks, ...addedThisRound].sort((a,b) => a.startMin - b.startMin));
-      return result;
-    } catch (e) {
-      return { error: e.message };
-    }
-  }, [categories, blocks]);
+      setCategories(newCats); return result;
+    } catch (e) { return { error: e.message }; }
+  }, [categories, blocks, templates, activeId]);
 
   if (!loaded) return <div style={{display:'flex',justifyContent:'center',alignItems:'center',height:'100vh',color:'var(--text-muted)'}}>読み込み中…</div>;
 
   return (
     <div className="app-container">
       <header className="app-header">
-        <h1 className="app-title">Ladders</h1>
-        <p className="app-subtitle">24hr生活リズム可視化</p>
+        <h1 className="app-title">24h ラダー・スケジューラー</h1>
+        <p className="app-subtitle">生活リズム可視化</p>
         <div className="header-actions">
           <button className="icon-btn" onClick={() => setShowSettings(true)} title="設定">{Icons.settings}</button>
         </div>
       </header>
 
-      {backupWarning && (
-        <div className="warning-banner">
-          ⚠ {lastBackup ? '最後のバックアップから30日以上経過しています' : 'まだバックアップがありません'}。エクスポートをおすすめします。
-        </div>
-      )}
-
-      <div className="tab-bar">
-        <button className={`tab-btn ${tab==='timeline'?'active':''}`} onClick={()=>setTab('timeline')}>タイムライン</button>
-        <button className={`tab-btn ${tab==='add'?'active':''}`} onClick={()=>setTab('add')}>ブロック追加</button>
-        <button className={`tab-btn ${tab==='category'?'active':''}`} onClick={()=>setTab('category')}>カテゴリ</button>
-        <button className={`tab-btn ${tab==='data'?'active':''}`} onClick={()=>setTab('data')}>データ</button>
+      <div className="template-switcher">
+        {templates.map(t => (
+          <button key={t.id} className={`tmpl-chip ${t.id === activeId ? 'active' : ''}`} onClick={() => switchTemplate(t.id)}>{t.title}</button>
+        ))}
+        <button className="tmpl-chip-add" onClick={() => addTemplate()} title="テンプレート追加">+</button>
       </div>
 
-      {tab === 'timeline' && (
-        <TimelineTab
-          displayBlocks={displayBlocks}
-          categories={categories}
-          summary={summary}
-          onDeleteBlock={deleteBlock}
-        />
-      )}
-      {tab === 'add' && (
-        <AddBlockTab
-          categories={categories}
-          lastBlockEnd={lastBlockEnd}
-          onAdd={addBlock}
-          showToast={showToast}
-          onSwitchTab={setTab}
-        />
-      )}
-      {tab === 'category' && (
-        <CategoryTab
-          categories={categories}
-          setCategories={setCategories}
-          blocks={blocks}
-          showToast={showToast}
-        />
-      )}
-      {tab === 'data' && (
-        <DataTab
-          onExport={exportData}
-          onImport={importData}
-          lastBackup={lastBackup}
-          showToast={showToast}
-        />
-      )}
+      {backupWarning && <div className="warning-banner">⚠ {lastBackup ? '最後のバックアップから30日以上経過しています' : 'まだバックアップがありません'}。エクスポートをおすすめします。</div>}
+
+      <div className="tab-bar">
+        <button className={`tab-btn ${tab === 'timeline' ? 'active' : ''}`} onClick={() => setTab('timeline')}>タイムライン</button>
+        <button className={`tab-btn ${tab === 'add' ? 'active' : ''}`} onClick={() => setTab('add')}>追加</button>
+        <button className={`tab-btn ${tab === 'category' ? 'active' : ''}`} onClick={() => setTab('category')}>カテゴリ</button>
+        <button className={`tab-btn ${tab === 'data' ? 'active' : ''}`} onClick={() => setTab('data')}>データ</button>
+      </div>
+
+      {tab === 'timeline' && <TimelineTab displayBlocks={displayBlocks} categories={categories} summary={summary} onDeleteBlock={deleteBlock} />}
+      {tab === 'add' && <AddBlockTab categories={categories} lastBlockEnd={lastBlockEnd} onAdd={addBlock} showToast={showToast} onSwitchTab={setTab} />}
+      {tab === 'category' && <CategoryTab categories={categories} setCategories={setCategories} blocks={blocks} showToast={showToast} />}
+      {tab === 'data' && <DataTab onExport={exportData} onImport={importData} lastBackup={lastBackup} showToast={showToast} />}
 
       {showSettings && (
-        <SettingsModal
-          meta={meta}
-          setMeta={setMeta}
-          blocks={blocks}
-          setBlocks={setBlocks}
-          categories={categories}
-          setCategories={setCategories}
-          onClose={() => setShowSettings(false)}
-          showToast={showToast}
-        />
+        <SettingsModal templates={templates} activeId={activeId} activeTmpl={activeTmpl}
+          onRename={renameTemplate} onDuplicate={duplicateTemplate} onDelete={deleteTemplate} onAddTemplate={addTemplate}
+          blocks={blocks} setBlocks={setBlocks} categories={categories} setCategories={setCategories} setTemplates={setTemplates}
+          onClose={() => setShowSettings(false)} showToast={showToast} />
       )}
-
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -924,19 +953,11 @@ function App() {
 
 function TimelineTab({ displayBlocks, categories, summary, onDeleteBlock }) {
   const [selectedBlock, setSelectedBlock] = useState(null);
-  const TRACK_HEIGHT = 720; // px for 24h
+  const TRACK_HEIGHT = 720;
   const PX_PER_MIN = TRACK_HEIGHT / 1440;
-
-  const catMap = useMemo(() => {
-    const m = {};
-    categories.forEach(c => m[c.id] = c);
-    return m;
-  }, [categories]);
-
+  const catMap = useMemo(() => { const m = {}; categories.forEach(c => m[c.id] = c); return m; }, [categories]);
   const timeLabels = [];
-  for (let h = 0; h <= 24; h += 3) {
-    timeLabels.push({ hour: h, y: (h * 60) * PX_PER_MIN });
-  }
+  for (let h = 0; h <= 24; h += 3) timeLabels.push({ hour: h, y: (h * 60) * PX_PER_MIN });
 
   return (
     <>
@@ -944,50 +965,33 @@ function TimelineTab({ displayBlocks, categories, summary, onDeleteBlock }) {
         <div className="card-title">{Icons.clock} タイムライン</div>
         <div className="timeline-container" style={{ height: TRACK_HEIGHT }}>
           <div className="time-axis">
-            {timeLabels.map(t => (
-              <span key={t.hour} className="time-label" style={{ top: t.y }}>
-                {String(t.hour).padStart(2,'0')}:00
-              </span>
-            ))}
+            {timeLabels.map(t => <span key={t.hour} className="time-label" style={{ top: t.y }}>{String(t.hour).padStart(2, '0')}:00</span>)}
           </div>
           <div className="timeline-track" style={{ height: TRACK_HEIGHT }}>
             {displayBlocks.map(b => {
-              const top = b.startMin * PX_PER_MIN;
-              const height = (b.endMin - b.startMin) * PX_PER_MIN;
-              const cat = catMap[b.categoryId];
-              const isFree = b.isFree;
+              const top = b.startMin * PX_PER_MIN, height = (b.endMin - b.startMin) * PX_PER_MIN;
+              const cat = catMap[b.categoryId], isFree = b.isFree;
               const bgColor = isFree ? undefined : (cat?.color || '#666');
               const label = isFree ? 'FREE' : (cat?.name || '?');
-              const showLabel = height >= 14;
-              const showTime = height >= 24;
-
               return (
-                <div
-                  key={b.id}
-                  className={`block-item ${isFree ? 'free-block' : ''}`}
+                <div key={b.id} className={`block-item ${isFree ? 'free-block' : ''}`}
                   style={{ top, height: Math.max(height, 1), backgroundColor: isFree ? undefined : bgColor }}
-                  onClick={() => !isFree && setSelectedBlock(b)}
-                >
-                  {showLabel && <span className={`block-label ${isFree?'free-label':''}`}>{label}</span>}
-                  {showTime && (
-                    <span className={`block-time ${isFree?'free-time':''}`}>
-                      {minToHHmm(b.startMin)}-{minToHHmm(b.endMin)}
-                    </span>
-                  )}
+                  onClick={() => !isFree && setSelectedBlock(b)}>
+                  {height >= 14 && <span className={`block-label ${isFree ? 'free-label' : ''}`}>{label}</span>}
+                  {height >= 24 && <span className={`block-time ${isFree ? 'free-time' : ''}`}>{minToHHmm(b.startMin)}-{minToHHmm(b.endMin)}</span>}
                 </div>
               );
             })}
           </div>
         </div>
       </div>
-
       {summary.length > 0 && (
         <div className="card">
           <div className="card-title">📊 集計</div>
           <div className="summary-grid">
             {summary.map(s => (
               <div key={s.id} className="summary-item">
-                <div className="summary-dot" style={{ backgroundColor: s.color }}/>
+                <div className="summary-dot" style={{ backgroundColor: s.color }} />
                 <span className="summary-name">{s.name}</span>
                 <span className="summary-time">{formatDuration(s.minutes)}</span>
               </div>
@@ -995,23 +999,17 @@ function TimelineTab({ displayBlocks, categories, summary, onDeleteBlock }) {
           </div>
         </div>
       )}
-
       {selectedBlock && (
         <div className="modal-overlay" onClick={() => setSelectedBlock(null)}>
           <div className="modal-content" onClick={e => e.stopPropagation()}>
             <div className="modal-title">ブロック詳細</div>
-            <p style={{fontSize:'0.85rem',marginBottom:8}}>
-              <strong>{catMap[selectedBlock.categoryId]?.name || '?'}</strong>
-            </p>
-            <p style={{fontSize:'0.8rem',color:'var(--text-secondary)',marginBottom:4}}>
-              {minToHHmm(selectedBlock.startMin)} 〜 {minToHHmm(selectedBlock.endMin)}
-              （{formatDuration(selectedBlock.endMin - selectedBlock.startMin)}）
+            <p style={{ fontSize: '0.85rem', marginBottom: 8 }}><strong>{catMap[selectedBlock.categoryId]?.name || '?'}</strong></p>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: 4 }}>
+              {minToHHmm(selectedBlock.startMin)} 〜 {minToHHmm(selectedBlock.endMin)}（{formatDuration(selectedBlock.endMin - selectedBlock.startMin)}）
             </p>
             <div className="delete-zone">
               <button className="btn btn-secondary btn-sm" onClick={() => setSelectedBlock(null)}>閉じる</button>
-              <button className="btn btn-danger btn-sm" onClick={() => { onDeleteBlock(selectedBlock.id); setSelectedBlock(null); }}>
-                {Icons.trash} 削除
-              </button>
+              <button className="btn btn-danger btn-sm" onClick={() => { onDeleteBlock(selectedBlock.id); setSelectedBlock(null); }}>{Icons.trash} 削除</button>
             </div>
           </div>
         </div>
@@ -1029,15 +1027,8 @@ function AddBlockTab({ categories, lastBlockEnd, onAdd, showToast, onSwitchTab }
   const [catId, setCatId] = useState(categories[0]?.id || '');
   const [error, setError] = useState('');
 
-  useEffect(() => {
-    const s = lastBlockEnd < 1440 ? lastBlockEnd : 0;
-    setStartMin(s);
-    setEndMin(Math.min(s + 60, 1440));
-  }, [lastBlockEnd]);
-
-  useEffect(() => {
-    if (!catId && categories.length) setCatId(categories[0].id);
-  }, [categories, catId]);
+  useEffect(() => { const s = lastBlockEnd < 1440 ? lastBlockEnd : 0; setStartMin(s); setEndMin(Math.min(s + 60, 1440)); }, [lastBlockEnd]);
+  useEffect(() => { if (!catId && categories.length) setCatId(categories[0].id); }, [categories, catId]);
 
   const handleSubmit = () => {
     setError('');
@@ -1045,22 +1036,15 @@ function AddBlockTab({ categories, lastBlockEnd, onAdd, showToast, onSwitchTab }
     const err = onAdd(startMin, endMin, catId);
     if (err) { setError(err); return; }
     showToast('ブロックを追加しました');
-    // Reset to next suggested
   };
 
-  if (categories.length === 0) {
-    return (
-      <div className="card">
-        <div className="card-title">{Icons.plus} ブロック追加</div>
-        <p style={{fontSize:'0.85rem',color:'var(--text-secondary)'}}>
-          先にカテゴリを作成してください。
-        </p>
-        <button className="btn btn-primary btn-sm" style={{marginTop:12}} onClick={() => onSwitchTab('category')}>
-          カテゴリを作成
-        </button>
-      </div>
-    );
-  }
+  if (categories.length === 0) return (
+    <div className="card">
+      <div className="card-title">{Icons.plus} ブロック追加</div>
+      <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>先にカテゴリを作成してください。</p>
+      <button className="btn btn-primary btn-sm" style={{ marginTop: 12 }} onClick={() => onSwitchTab('category')}>カテゴリを作成</button>
+    </div>
+  );
 
   return (
     <div className="card">
@@ -1068,11 +1052,7 @@ function AddBlockTab({ categories, lastBlockEnd, onAdd, showToast, onSwitchTab }
       <div className="form-row">
         <div className="form-group">
           <label className="form-label">開始時刻</label>
-          <select value={startMin} onChange={e => {
-            const v = Number(e.target.value);
-            setStartMin(v);
-            if (endMin <= v) setEndMin(Math.min(v + 15, 1440));
-          }}>
+          <select value={startMin} onChange={e => { const v = Number(e.target.value); setStartMin(v); if (endMin <= v) setEndMin(Math.min(v + 15, 1440)); }}>
             {START_OPTIONS.map(m => <option key={m} value={m}>{minToHHmm(m)}</option>)}
           </select>
         </div>
@@ -1083,18 +1063,14 @@ function AddBlockTab({ categories, lastBlockEnd, onAdd, showToast, onSwitchTab }
           </select>
         </div>
       </div>
-      <div className="form-group" style={{marginBottom:12}}>
+      <div className="form-group" style={{ marginBottom: 12 }}>
         <label className="form-label">カテゴリ</label>
         <select value={catId} onChange={e => setCatId(e.target.value)}>
-          {categories.map(c => (
-            <option key={c.id} value={c.id}>● {c.name}</option>
-          ))}
+          {categories.map(c => <option key={c.id} value={c.id}>● {c.name}</option>)}
         </select>
       </div>
       {error && <p className="error-text">{error}</p>}
-      <button className="btn btn-primary btn-block" onClick={handleSubmit}>
-        {Icons.plus} 保存
-      </button>
+      <button className="btn btn-primary btn-block" onClick={handleSubmit}>{Icons.plus} 保存</button>
     </div>
   );
 }
@@ -1107,80 +1083,57 @@ function CategoryTab({ categories, setCategories, blocks, showToast }) {
   const [name, setName] = useState('');
   const [color, setColor] = useState(PALETTE[0]);
 
-  const startAdd = () => { setName(''); setColor(PALETTE[Math.floor(Math.random()*PALETTE.length)]); setEditCat(null); setShowAdd(true); };
-  const startEdit = (c) => { setName(c.name); setColor(c.color); setEditCat(c); setShowAdd(true); };
-
+  const startAdd = () => { setName(''); setColor(PALETTE[Math.floor(Math.random() * PALETTE.length)]); setEditCat(null); setShowAdd(true); };
+  const startEdit = c => { setName(c.name); setColor(c.color); setEditCat(c); setShowAdd(true); };
   const handleSave = () => {
     if (!name.trim()) return;
-    if (editCat) {
-      setCategories(prev => prev.map(c => c.id === editCat.id ? { ...c, name: name.trim(), color } : c));
-      showToast('カテゴリを更新しました');
-    } else {
-      setCategories(prev => [...prev, { id: uuid(), name: name.trim(), color }]);
-      showToast('カテゴリを追加しました');
-    }
+    if (editCat) { setCategories(p => p.map(c => c.id === editCat.id ? { ...c, name: name.trim(), color } : c)); showToast('カテゴリを更新しました'); }
+    else { setCategories(p => [...p, { id: uuid(), name: name.trim(), color }]); showToast('カテゴリを追加しました'); }
     setShowAdd(false);
   };
-
-  const handleDelete = (id) => {
-    const used = blocks.some(b => b.categoryId === id);
-    if (used) { showToast('使用中のカテゴリは削除できません'); return; }
-    setCategories(prev => prev.filter(c => c.id !== id));
-    showToast('カテゴリを削除しました');
-    setShowAdd(false);
+  const handleDelete = id => {
+    if (blocks.some(b => b.categoryId === id)) { showToast('使用中のカテゴリは削除できません'); return; }
+    setCategories(p => p.filter(c => c.id !== id)); showToast('カテゴリを削除しました'); setShowAdd(false);
   };
 
   return (
     <>
       <div className="card">
-        <div className="card-title" style={{justifyContent:'space-between'}}>
+        <div className="card-title" style={{ justifyContent: 'space-between' }}>
           <span>🏷 カテゴリ</span>
           <button className="btn btn-primary btn-sm" onClick={startAdd}>{Icons.plus} 追加</button>
         </div>
-        {categories.length === 0 ? (
-          <p style={{fontSize:'0.8rem',color:'var(--text-muted)'}}>カテゴリがありません。追加してください。</p>
-        ) : (
+        {categories.length === 0 ? <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>カテゴリがありません。追加してください。</p> : (
           <div className="cat-list">
             {categories.map(c => (
-              <div key={c.id} className="cat-item" onClick={() => startEdit(c)} style={{cursor:'pointer'}}>
-                <div className="cat-color" style={{backgroundColor:c.color}}/>
+              <div key={c.id} className="cat-item" onClick={() => startEdit(c)}>
+                <div className="cat-color" style={{ backgroundColor: c.color }} />
                 <span className="cat-name">{c.name}</span>
-                <span style={{color:'var(--text-muted)',fontSize:'0.7rem'}}>{Icons.edit}</span>
+                <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>{Icons.edit}</span>
               </div>
             ))}
           </div>
         )}
       </div>
-
       {showAdd && (
         <div className="modal-overlay" onClick={() => setShowAdd(false)}>
           <div className="modal-content" onClick={e => e.stopPropagation()}>
             <div className="modal-title">{editCat ? 'カテゴリ編集' : 'カテゴリ追加'}</div>
-            <div className="form-group" style={{marginBottom:12}}>
+            <div className="form-group" style={{ marginBottom: 12 }}>
               <label className="form-label">名前</label>
               <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="例: 睡眠, 仕事, 食事..." autoFocus />
             </div>
-            <div className="form-group" style={{marginBottom:16}}>
+            <div className="form-group" style={{ marginBottom: 16 }}>
               <label className="form-label">カラー</label>
               <div className="color-grid">
-                {PALETTE.map(c => (
-                  <div key={c} className={`color-swatch ${color===c?'selected':''}`} style={{backgroundColor:c}} onClick={()=>setColor(c)}/>
-                ))}
+                {PALETTE.map(c => <div key={c} className={`color-swatch ${color === c ? 'selected' : ''}`} style={{ backgroundColor: c }} onClick={() => setColor(c)} />)}
               </div>
             </div>
-            <div style={{display:'flex',gap:8}}>
-              <button className="btn btn-primary" style={{flex:1}} onClick={handleSave}>
-                {editCat ? '更新' : '追加'}
-              </button>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-primary" style={{ flex: 1 }} onClick={handleSave}>{editCat ? '更新' : '追加'}</button>
               <button className="btn btn-secondary" onClick={() => setShowAdd(false)}>キャンセル</button>
             </div>
-            {editCat && (
-              <div className="delete-zone">
-                <button className="btn btn-danger btn-sm" onClick={() => handleDelete(editCat.id)}>
-                  {Icons.trash} 削除
-                </button>
-              </div>
-            )}
+            {editCat && <div className="delete-zone"><button className="btn btn-danger btn-sm" onClick={() => handleDelete(editCat.id)}>{Icons.trash} 削除</button></div>}
           </div>
         </div>
       )}
@@ -1193,66 +1146,40 @@ function CategoryTab({ categories, setCategories, blocks, showToast }) {
 function DataTab({ onExport, onImport, lastBackup, showToast }) {
   const [importResult, setImportResult] = useState(null);
   const fileRef = useRef();
-
-  const handleFile = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+  const handleFile = e => {
+    const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      const result = onImport(ev.target.result);
-      setImportResult(result);
-      if (!result.error) showToast('インポート完了');
-    };
-    reader.readAsText(file);
-    e.target.value = '';
+    reader.onload = async ev => { const result = await onImport(ev.target.result); setImportResult(result); if (!result.error) showToast('インポート完了'); };
+    reader.readAsText(file); e.target.value = '';
   };
 
   return (
     <>
       <div className="card">
         <div className="card-title">{Icons.download} エクスポート</div>
-        <p style={{fontSize:'0.8rem',color:'var(--text-secondary)',marginBottom:10}}>
-          全データをJSONファイルでダウンロードします。
-        </p>
-        {lastBackup && (
-          <p style={{fontSize:'0.7rem',color:'var(--text-muted)',marginBottom:10}}>
-            最終バックアップ: {new Date(lastBackup).toLocaleString('ja-JP')}
-          </p>
-        )}
-        <button className="btn btn-primary btn-block" onClick={onExport}>
-          {Icons.download} JSONをダウンロード
-        </button>
+        <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: 10 }}>全テンプレートのデータをJSONでダウンロードします。</p>
+        {lastBackup && <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: 10 }}>最終バックアップ: {new Date(lastBackup).toLocaleString('ja-JP')}</p>}
+        <button className="btn btn-primary btn-block" onClick={onExport}>{Icons.download} JSONをダウンロード</button>
       </div>
-
       <div className="card">
         <div className="card-title">{Icons.upload} インポート（マージ）</div>
-        <p style={{fontSize:'0.8rem',color:'var(--text-secondary)',marginBottom:4}}>
-          既存データに追加（上書きしません）。
-        </p>
-        <p style={{fontSize:'0.7rem',color:'var(--text-muted)',marginBottom:10}}>
-          同じIDは自動スキップ。時間重複もスキップ。
-        </p>
-        <input type="file" accept=".json" ref={fileRef} style={{display:'none'}} onChange={handleFile}/>
-        <button className="btn btn-secondary btn-block" onClick={() => fileRef.current?.click()}>
-          {Icons.upload} JSONを選択
-        </button>
+        <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: 4 }}>既存データに追加（上書きしません）。v1形式にも対応。</p>
+        <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: 10 }}>同じIDは自動スキップ。時間重複もスキップ。</p>
+        <input type="file" accept=".json" ref={fileRef} style={{ display: 'none' }} onChange={handleFile} />
+        <button className="btn btn-secondary btn-block" onClick={() => fileRef.current?.click()}>{Icons.upload} JSONを選択</button>
         {importResult && !importResult.error && (
           <div className="import-result">
+            {importResult.tmplAdded > 0 && <p><span className="success">✓ テンプレート追加: {importResult.tmplAdded}件</span></p>}
+            {importResult.tmplSkipped > 0 && <p><span className="skip">↳ テンプレートスキップ: {importResult.tmplSkipped}件</span></p>}
             <p><span className="success">✓ カテゴリ追加: {importResult.catAdded}件</span> / スキップ: {importResult.catSkipped}件</p>
             <p><span className="success">✓ ブロック追加: {importResult.blockAdded}件</span></p>
             {importResult.blockDuplicate > 0 && <p><span className="skip">↳ 重複スキップ: {importResult.blockDuplicate}件</span></p>}
             {importResult.blockInvalid > 0 && <p><span className="skip">↳ バリデーションNG: {importResult.blockInvalid}件</span></p>}
             {importResult.blockOverlap > 0 && <p><span className="error">↳ 時間重複スキップ: {importResult.blockOverlap}件</span></p>}
-            {importResult.blockOverlap > 0 && (
-              <p style={{marginTop:6}} className="error">⚠ 時間が重なっているブロックがスキップされました</p>
-            )}
+            {importResult.blockOverlap > 0 && <p style={{ marginTop: 6 }} className="error">⚠ 時間が重なっているブロックがスキップされました</p>}
           </div>
         )}
-        {importResult?.error && (
-          <div className="import-result">
-            <p className="error">エラー: {importResult.error}</p>
-          </div>
-        )}
+        {importResult?.error && <div className="import-result"><p className="error">エラー: {importResult.error}</p></div>}
       </div>
     </>
   );
@@ -1260,56 +1187,75 @@ function DataTab({ onExport, onImport, lastBackup, showToast }) {
 
 // ─── Settings Modal ──────────────────────────────────────────
 
-function SettingsModal({ meta, setMeta, blocks, setBlocks, categories, setCategories, onClose, showToast }) {
-  const [title, setTitle] = useState(meta.title);
+function SettingsModal({ templates, activeId, activeTmpl, onRename, onDuplicate, onDelete, onAddTemplate, blocks, setBlocks, categories, setCategories, setTemplates, onClose, showToast }) {
+  const [editingId, setEditingId] = useState(null);
+  const [editTitle, setEditTitle] = useState('');
   const [confirmReset, setConfirmReset] = useState(false);
+  const [showNewForm, setShowNewForm] = useState(false);
+  const [newTmplName, setNewTmplName] = useState('');
 
-  const handleTitleSave = () => {
-    setMeta(prev => ({ ...prev, title: title.trim() || '生活テンプレート' }));
-    showToast('タイトルを更新しました');
-  };
+  const startRename = t => { setEditingId(t.id); setEditTitle(t.title); };
+  const saveRename = () => { if (editTitle.trim()) { onRename(editingId, editTitle.trim()); showToast('名前を変更しました'); } setEditingId(null); };
 
-  const handleReset = () => {
-    setBlocks([]);
-    setCategories([]);
-    setMeta({ title: '生活テンプレート', createdAt: new Date().toISOString() });
-    showToast('全データを削除しました');
-    onClose();
+  const handleReset = async () => {
+    for (const t of templates) await dbDel('blocks:' + t.id);
+    const id = uuid();
+    const t = { id, title: '平日', createdAt: new Date().toISOString() };
+    await dbSet('templates', [t]); await dbSet('blocks:' + id, []);
+    await dbSet('categories', []); await dbSet('activeTemplateId', id);
+    showToast('全データを削除しました'); window.location.reload();
   };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
-        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
-          <div className="modal-title" style={{marginBottom:0}}>設定</div>
-          <button className="icon-btn" onClick={onClose} style={{width:28,height:28}}>{Icons.x}</button>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div className="modal-title" style={{ marginBottom: 0 }}>設定</div>
+          <button className="icon-btn" onClick={onClose} style={{ width: 28, height: 28 }}>{Icons.x}</button>
         </div>
 
-        <div className="form-group" style={{marginBottom:12}}>
-          <label className="form-label">テンプレート名</label>
-          <div style={{display:'flex',gap:8}}>
-            <input type="text" value={title} onChange={e => setTitle(e.target.value)} />
-            <button className="btn btn-primary btn-sm" onClick={handleTitleSave}>保存</button>
+        <div className="card-title" style={{ marginBottom: 8 }}>📋 テンプレート管理</div>
+        {templates.map(t => (
+          <div key={t.id} className={`tmpl-manage-item ${t.id === activeId ? 'active-tmpl' : ''}`}>
+            {editingId === t.id ? (
+              <input type="text" value={editTitle} onChange={e => setEditTitle(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') saveRename(); }} onBlur={saveRename} autoFocus
+                style={{ flex: 1, fontSize: '0.85rem', padding: '4px 8px' }} />
+            ) : (
+              <span className="tmpl-manage-name">{t.title} {t.id === activeId && <span style={{ fontSize: '0.6rem', color: 'var(--accent)' }}>● 現在</span>}</span>
+            )}
+            <div className="tmpl-manage-actions">
+              <button className="btn btn-secondary btn-sm" onClick={() => startRename(t)} title="名前変更">{Icons.edit}</button>
+              <button className="btn btn-secondary btn-sm" onClick={() => onDuplicate(t.id)} title="複製">{Icons.copy}</button>
+              {templates.length > 1 && <button className="btn btn-danger btn-sm" onClick={() => onDelete(t.id)} title="削除">{Icons.trash}</button>}
+            </div>
           </div>
+        ))}
+
+        {showNewForm ? (
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <input type="text" value={newTmplName} onChange={e => setNewTmplName(e.target.value)} placeholder="テンプレート名" autoFocus
+              onKeyDown={e => { if (e.key === 'Enter' && newTmplName.trim()) { onAddTemplate(newTmplName.trim()); setNewTmplName(''); setShowNewForm(false); onClose(); } }} />
+            <button className="btn btn-primary btn-sm" onClick={() => { if (newTmplName.trim()) { onAddTemplate(newTmplName.trim()); setNewTmplName(''); setShowNewForm(false); onClose(); } }}>作成</button>
+            <button className="btn btn-secondary btn-sm" onClick={() => setShowNewForm(false)}>×</button>
+          </div>
+        ) : (
+          <button className="btn btn-secondary btn-block btn-sm" style={{ marginTop: 8 }} onClick={() => setShowNewForm(true)}>{Icons.plus} テンプレートを追加</button>
+        )}
+
+        <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: 4 }}>現在のテンプレート: {activeTmpl?.title} / ブロック数: {blocks.length}</p>
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: 16 }}>カテゴリ数: {categories.length}（全テンプレート共通）</p>
         </div>
 
-        <p style={{fontSize:'0.7rem',color:'var(--text-muted)',marginBottom:4}}>
-          作成日: {new Date(meta.createdAt).toLocaleDateString('ja-JP')}
-        </p>
-        <p style={{fontSize:'0.7rem',color:'var(--text-muted)',marginBottom:16}}>
-          ブロック数: {blocks.length} / カテゴリ数: {categories.length}
-        </p>
-
-        <div style={{borderTop:'1px solid var(--border)',paddingTop:16}}>
+        <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
           {!confirmReset ? (
-            <button className="btn btn-danger btn-block btn-sm" onClick={() => setConfirmReset(true)}>
-              {Icons.trash} 全データを削除
-            </button>
+            <button className="btn btn-danger btn-block btn-sm" onClick={() => setConfirmReset(true)}>{Icons.trash} 全データを削除</button>
           ) : (
             <div>
-              <p style={{fontSize:'0.8rem',color:'var(--danger)',marginBottom:8}}>本当に全データを削除しますか？この操作は取り消せません。</p>
-              <div style={{display:'flex',gap:8}}>
-                <button className="btn btn-danger" style={{flex:1}} onClick={handleReset}>削除する</button>
+              <p style={{ fontSize: '0.8rem', color: 'var(--danger)', marginBottom: 8 }}>本当に全データを削除しますか？この操作は取り消せません。</p>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-danger" style={{ flex: 1 }} onClick={handleReset}>削除する</button>
                 <button className="btn btn-secondary" onClick={() => setConfirmReset(false)}>キャンセル</button>
               </div>
             </div>
@@ -1321,8 +1267,8 @@ function SettingsModal({ meta, setMeta, blocks, setBlocks, categories, setCatego
 }
 
 // ─── Render ──────────────────────────────────────────────────
-
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
 </script>
 
 <script>
